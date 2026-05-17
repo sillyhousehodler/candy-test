@@ -23,6 +23,11 @@ const CFG = {
   OY: 80,   // Board top  edge Y in pixels.  Leaves 80 px for the HUD bar above.
   W: 600,   // Canvas width  in pixels.
   H: 640,   // Canvas height in pixels.
+
+  // ── Input feel ─────────────────────────────────────────────────────────────
+  AXIS_SWITCH_VEL: 8,  // Min perpendicular frame-velocity (px/frame) to trigger an axis change.
+                        // Raise if switching feels too easy; lower if it feels sluggish.
+                        // Good range to explore: 5–20.
 };
 
 // ── Candy color palette ────────────────────────────────────────────────────
@@ -43,7 +48,7 @@ const DARK_COLORS = [0xB03A2E, 0x2E86C1, 0x239B56, 0xD4AC0D, 0x7D3C98];
 const LEVELS = [
   { target: 1000, moves: 20 }, // Level 1 — introductory
   { target: 1200, moves: 20 }, // Level 2 — intermediate
-  { target: 1500, moves: 18 }, // Level 3 — challenging
+  { target: 1500, moves: 25 }, // Level 3 — challenging
 ];
 
 // ─── BOOT SCENE ──────────────────────────────────────────────────────────────
@@ -73,10 +78,15 @@ class GameScene extends Phaser.Scene {
     this.movesMax     = lvl.moves;   // starting move budget for this level
     this.board    = [];   // board[r][c] = type id (0-4), -1 = empty
     this.sprites  = [];   // sprites[r][c] = Phaser.GameObjects.Graphics
-    this.dragSprite = null; // candy the pointer went down on
-    this.dragStartX  = 0;
-    this.dragStartY  = 0;
-    this.dragAxis    = null; // 'h' | 'v' — locked once drag exceeds threshold
+    this.dragSprite      = null; // candy the pointer went down on
+    this.dragStartX      = 0;
+    this.dragStartY      = 0;
+    this.dragAxis        = null;  // 'h' | 'v' — locked once drag exceeds threshold
+    this.axisRefX        = 0;    // pointer reference for delta; reset on each axis change
+    this.axisRefY        = 0;
+    this.prevPointerX    = 0;    // last-frame pointer pos for frame-velocity axis detection
+    this.prevPointerY    = 0;
+    this.previewNeighbor = null; // gem currently displaced into the preview slot
     this.score    = 0;
     this.moves    = this.movesMax;
     this.busy     = false; // blocks input during animations
@@ -440,84 +450,163 @@ class GameScene extends Phaser.Scene {
    * @param {Phaser.Input.Pointer}        pointer - Phaser pointer event.
    */
   onDragStart(sprite, pointer) {
-    this.dragSprite  = sprite;
-    this.dragStartX  = pointer.x;
-    this.dragStartY  = pointer.y;
-    this.dragAxis    = null;
-    sprite._origX    = sprite.x;   // grid-centre position before any drag
-    sprite._origY    = sprite.y;
-    sprite.setDepth(1);            // float above neighbouring gems while held
+    this.dragSprite      = sprite;
+    this.dragStartX      = pointer.x;
+    this.dragStartY      = pointer.y;
+    this.dragAxis        = null;
+    this.axisRefX        = pointer.x; // reset reference; used for all delta computation
+    this.axisRefY        = pointer.y;
+    this.prevPointerX    = pointer.x;
+    this.prevPointerY    = pointer.y;
+    this.previewNeighbor = null;
+    sprite._origX        = sprite.x;  // grid-centre position before any drag
+    sprite._origY        = sprite.y;
+    sprite.setDepth(1);               // float above neighbouring gems while held
   }
 
   /**
-   * Moves the dragged gem to follow the pointer in real time.
+   * Moves the dragged gem in real time and manages the live-preview swap.
    *
-   * Axis lock: once the pointer has moved > 8 px the dominant direction
-   * (horizontal or vertical) is fixed for the rest of the drag, matching
-   * the feel of mobile Candy Crush.
-   * Travel is capped at one full cell so the gem can never overshoot the
-   * adjacent slot.
+   * Axis lock: dominant direction locked after 8 px of travel from the drag
+   *   start (or from the last axis-switch reference point).
+   * Axis switch: allowed only when the gem is back in its own cell and no
+   *   preview is active. The perpendicular frame-velocity must exceed
+   *   CFG.AXIS_SWITCH_VEL (default 8 px/frame) to filter out the accidental
+   *   jitter that always accompanies real mouse/touch input. When triggered,
+   *   the axis reference resets and the gem snaps to the slot centre in a
+   *   single frame before movement resumes on the new axis.
+   * Preview: whenever the gem's centre crosses into an adjacent cell, that
+   *   neighbour slides to the gem's home slot (200 ms tween). Dragging back
+   *   cancels the preview with a matching return tween.
    */
   onDragMove(pointer) {
     if (!this.dragSprite || this.busy) return;
 
-    const dx    = pointer.x - this.dragStartX;
-    const dy    = pointer.y - this.dragStartY;
-    const absDx = Math.abs(dx);
-    const absDy = Math.abs(dy);
+    // Delta from the current axis reference (reset whenever axis changes)
+    const dx = pointer.x - this.axisRefX;
+    const dy = pointer.y - this.axisRefY;
 
-    // Engage axis lock after the pointer has moved far enough
-    if (!this.dragAxis && Math.max(absDx, absDy) > 8) {
-      this.dragAxis = absDx >= absDy ? 'h' : 'v';
+    // Frame velocity — used for immediate axis-switch detection
+    const velX = pointer.x - this.prevPointerX;
+    const velY = pointer.y - this.prevPointerY;
+    this.prevPointerX = pointer.x;
+    this.prevPointerY = pointer.y;
+
+    // ── Initial axis lock ─────────────────────────────────────────────────
+    if (!this.dragAxis) {
+      if (Math.max(Math.abs(dx), Math.abs(dy)) <= 8) return;
+      this.dragAxis = Math.abs(dx) >= Math.abs(dy) ? 'h' : 'v';
     }
-
-    if (!this.dragAxis) return; // tap / no movement yet — gem stays put
 
     const origX = this.dragSprite._origX;
     const origY = this.dragSprite._origY;
-    const cap   = CFG.CELL; // maximum travel = one cell
+    const cap   = CFG.CELL;
 
+    // ── Compute target position on current axis ───────────────────────────
+    let newX, newY;
     if (this.dragAxis === 'h') {
-      this.dragSprite.x = origX + Phaser.Math.Clamp(dx, -cap, cap);
-      this.dragSprite.y = origY;
+      newX = origX + Phaser.Math.Clamp(dx, -cap, cap);
+      newY = origY;
     } else {
-      this.dragSprite.x = origX;
-      this.dragSprite.y = origY + Phaser.Math.Clamp(dy, -cap, cap);
+      newX = origX;
+      newY = origY + Phaser.Math.Clamp(dy, -cap, cap);
     }
+
+    // ── Which grid cell is the gem centre currently over? ─────────────────
+    const curCol    = Phaser.Math.Clamp(Math.floor((newX - CFG.OX) / CFG.CELL), 0, CFG.COLS - 1);
+    const curRow    = Phaser.Math.Clamp(Math.floor((newY - CFG.OY) / CFG.CELL), 0, CFG.ROWS - 1);
+    const inOwnCell = (curCol === this.dragSprite.col && curRow === this.dragSprite.row);
+
+    // ── Axis switch (only in own cell, only when no preview is active) ────
+    // Requires a minimum perpendicular frame-velocity (CFG.AXIS_SWITCH_VEL) to
+    // filter out the tiny jitter that always accompanies real mouse/touch input.
+    if (inOwnCell && !this.previewNeighbor) {
+      if (this.dragAxis === 'h' && Math.abs(velY) > CFG.AXIS_SWITCH_VEL) {
+        this.dragAxis     = 'v';
+        this.axisRefX     = pointer.x; // fresh reference so next frame dy starts at 0
+        this.axisRefY     = pointer.y;
+        this.dragSprite.x = origX;     // instant snap to slot centre
+        this.dragSprite.y = origY;
+        return;
+      }
+      if (this.dragAxis === 'v' && Math.abs(velX) > CFG.AXIS_SWITCH_VEL) {
+        this.dragAxis     = 'h';
+        this.axisRefX     = pointer.x;
+        this.axisRefY     = pointer.y;
+        this.dragSprite.x = origX;
+        this.dragSprite.y = origY;
+        return;
+      }
+    }
+
+    // ── Live preview management ───────────────────────────────────────────
+    const dc = curCol - this.dragSprite.col;
+    const dr = curRow - this.dragSprite.row;
+
+    if (Math.abs(dc) + Math.abs(dr) === 1) {
+      // Gem centre entered an adjacent cell — preview that neighbour
+      const neighbor = this.sprites[this.dragSprite.row + dr][this.dragSprite.col + dc];
+      if (this.previewNeighbor !== neighbor) {
+        this.cancelPreview();
+        this.startPreview(neighbor);
+      }
+    } else if (inOwnCell && this.previewNeighbor) {
+      // Gem returned to own cell — cancel the active preview
+      this.cancelPreview();
+    }
+
+    // ── Apply gem position ────────────────────────────────────────────────
+    this.dragSprite.x = newX;
+    this.dragSprite.y = newY;
   }
 
   /**
    * Resolves the drag on pointer-up.
    *
-   * Primary path (gem moved visually): decide by which grid cell the gem's
-   * CENTRE is currently sitting in.
-   *   • Still in its original cell → springy snap back.
-   *   • In an adjacent cell        → attempt swap.
-   *
-   * Fallback path (fast swipe — pointermove never fired): fall back to the
-   * pointer displacement, requiring ≥ 30 % of a cell to trigger a swap.
+   * • Gem centre in adjacent cell  → confirm swap (preview already shows it).
+   * • Gem centre in own cell       → cancel preview + springy snap home.
+   * • Fast swipe (axis never set)  → fallback pointer-delta path.
    */
   onDragEnd(pointer) {
     if (!this.dragSprite || this.busy) { this.dragSprite = null; return; }
 
     const src = this.dragSprite;
     this.dragSprite = null;
-    src.setDepth(0); // restore normal render order
+    src.setDepth(0);
 
-    if (this.dragAxis) {
-      // Gem has moved — decide by where the centre is now
-      const curCol = Phaser.Math.Clamp(Math.floor((src.x - CFG.OX) / CFG.CELL), 0, CFG.COLS - 1);
-      const curRow = Phaser.Math.Clamp(Math.floor((src.y - CFG.OY) / CFG.CELL), 0, CFG.ROWS - 1);
-      const dc = curCol - src.col;
-      const dr = curRow - src.row;
+    // Which cell is the gem centre currently over?
+    const curCol = Phaser.Math.Clamp(Math.floor((src.x - CFG.OX) / CFG.CELL), 0, CFG.COLS - 1);
+    const curRow = Phaser.Math.Clamp(Math.floor((src.y - CFG.OY) / CFG.CELL), 0, CFG.ROWS - 1);
+    const dc = curCol - src.col;
+    const dr = curRow - src.row;
 
-      if (Math.abs(dr) + Math.abs(dc) === 1) {
-        // Centre is in an adjacent cell — attempt swap
-        this.trySwap(src, this.sprites[src.row + dr][src.col + dc], src._origX, src._origY);
-        return;
+    if (Math.abs(dr) + Math.abs(dc) === 1) {
+      // ── Confirm swap ────────────────────────────────────────────────────
+      const neighbor = this.sprites[src.row + dr][src.col + dc];
+
+      // Use stored grid-home coordinates (computed from row/col, immune to
+      // mid-tween drift) so trySwap animates to exact pixel-perfect targets.
+      const origX2 = (neighbor._previewOrigX !== undefined)
+        ? neighbor._previewOrigX
+        : CFG.OX + neighbor.col * CFG.CELL + CFG.CELL / 2;
+      const origY2 = (neighbor._previewOrigY !== undefined)
+        ? neighbor._previewOrigY
+        : CFG.OY + neighbor.row * CFG.CELL + CFG.CELL / 2;
+
+      // Freeze the preview tween — trySwap takes over both animations.
+      if (this.previewNeighbor) {
+        this.tweens.killTweensOf(this.previewNeighbor);
+        this.previewNeighbor = null;
       }
 
-      // Centre is still in the original cell — snap back
+      this.trySwap(src, neighbor, src._origX, src._origY, origX2, origY2, true);
+      return;
+    }
+
+    // ── Cancel preview and snap gem home ──────────────────────────────────
+    this.cancelPreview();
+
+    if (this.dragAxis) {
       this.tweens.add({
         targets: src, x: src._origX, y: src._origY,
         duration: 200, ease: 'Back.easeOut',
@@ -525,53 +614,106 @@ class GameScene extends Phaser.Scene {
       return;
     }
 
-    // Fallback: fast swipe — gem never visually moved, use pointer delta
-    const dx    = pointer.x - this.dragStartX;
-    const dy    = pointer.y - this.dragStartY;
+    // ── Fallback: fast swipe — axis never locked, use pointer delta ────────
+    const dx    = pointer.x - this.axisRefX;
+    const dy    = pointer.y - this.axisRefY;
     const absDx = Math.abs(dx);
     const absDy = Math.abs(dy);
     if (Math.max(absDx, absDy) >= CFG.CELL * 0.3) {
-      let dr = 0, dc = 0;
-      if (absDx >= absDy) dc = dx > 0 ? 1 : -1;
-      else                dr = dy > 0 ? 1 : -1;
-      const r2 = src.row + dr, c2 = src.col + dc;
+      let fdr = 0, fdc = 0;
+      if (absDx >= absDy) fdc = dx > 0 ? 1 : -1;
+      else                fdr = dy > 0 ? 1 : -1;
+      const r2 = src.row + fdr, c2 = src.col + fdc;
       if (r2 >= 0 && r2 < CFG.ROWS && c2 >= 0 && c2 < CFG.COLS) {
-        this.trySwap(src, this.sprites[r2][c2], src._origX, src._origY);
+        const nb   = this.sprites[r2][c2];
+        const ox2  = CFG.OX + nb.col * CFG.CELL + CFG.CELL / 2;
+        const oy2  = CFG.OY + nb.row * CFG.CELL + CFG.CELL / 2;
+        this.trySwap(src, nb, src._origX, src._origY, ox2, oy2);
       }
     }
-    // else: plain tap — no action (gem is already at _origX/_origY)
+    // else: plain tap — gem is already at _origX/_origY, nothing to do
+  }
+
+  // ── PREVIEW HELPERS ────────────────────────────────────────────────────────
+  /**
+   * Displaces `neighbor` to the dragged gem's home slot as a live preview.
+   * The neighbour's true grid-centre is computed from its logical row/col
+   * (not from its current pixel position) so the stored origin is always
+   * correct even if a previous tween was still in flight when called.
+   *
+   * @param {Phaser.GameObjects.Graphics} neighbor
+   */
+  startPreview(neighbor) {
+    neighbor._previewOrigX = CFG.OX + neighbor.col * CFG.CELL + CFG.CELL / 2;
+    neighbor._previewOrigY = CFG.OY + neighbor.row * CFG.CELL + CFG.CELL / 2;
+    this.tweens.killTweensOf(neighbor);
+    this.tweens.add({
+      targets: neighbor,
+      x: this.dragSprite._origX,
+      y: this.dragSprite._origY,
+      duration: 200, ease: 'Power2',
+    });
+    this.previewNeighbor = neighbor;
+  }
+
+  /**
+   * Returns the currently-previewed gem back to its grid slot, cancelling
+   * the live preview. Safe to call when no preview is active (no-op guard).
+   */
+  cancelPreview() {
+    if (!this.previewNeighbor) return;
+    const n = this.previewNeighbor;
+    this.previewNeighbor = null;
+    this.tweens.killTweensOf(n);
+    this.tweens.add({
+      targets: n,
+      x: n._previewOrigX,
+      y: n._previewOrigY,
+      duration: 200, ease: 'Power2',
+    });
   }
 
   // ── SWAP LOGIC ─────────────────────────────────────────────────────────────
   /**
    * Full swap pipeline for two adjacent candies.
    *
-   * Phase 1 — Animate both sprites to each other's pixel position.
+   * Phase 1 — Position both sprites at each other's grid home.
+   *   • skipForwardAnim = false (fast-swipe path): animate both with a
+   *     200 ms Power2 tween.
+   *   • skipForwardAnim = true  (drag-release path): snap both instantly.
+   *     Gem A was dragged to slot B by the player; gem B was already slid
+   *     to slot A by the live preview. No forward animation is needed.
    * Phase 2 — Commit the swap in the board data and sprite-tracking arrays.
    * Phase 3 — Run match detection on the updated board.
    *   • No matches → invalid swap: revert board data, sprite tracking, and
-   *     animate both sprites back. Move counter is NOT decremented.
+   *     animate both sprites back to their original grid homes.
+   *     Move counter is NOT decremented.
    *   • Matches found → valid swap: decrement move counter, update HUD,
    *     then hand off to processMatches().
    *
    * Sets this.busy = true for the entire duration to block further input.
    *
-   * @param {Phaser.GameObjects.Graphics} s1 - First candy.
-   * @param {Phaser.GameObjects.Graphics} s2 - Second candy (must be adjacent to s1).
+   * @param {Phaser.GameObjects.Graphics} s1  - First candy (the dragged gem).
+   * @param {Phaser.GameObjects.Graphics} s2  - Second candy (must be adjacent to s1).
+   * @param {number}  origX1 - Grid-centre X of s1’s home slot.
+   * @param {number}  origY1 - Grid-centre Y of s1’s home slot.
+   * @param {number}  origX2 - Grid-centre X of s2’s home slot.
+   * @param {number}  origY2 - Grid-centre Y of s2’s home slot.
+   * @param {boolean} [skipForwardAnim=false] - Skip the forward slide animation
+   *   when both gems are already in their destination positions (drag + preview).
    */
-  trySwap(s1, s2, origX1, origY1) {
+  trySwap(s1, s2, origX1, origY1, origX2, origY2, skipForwardAnim = false) {
     this.busy = true;
     const r1 = s1.row, c1 = s1.col, r2 = s2.row, c2 = s2.col;
-    // origX1/origY1 are the grid-home of s1 (passed when called after a drag
-    // so the revert animation returns to the correct position, not wherever
-    // the gem was dropped mid-drag).
+    // origX1/Y1 — grid-home of s1; origX2/Y2 — grid-home of s2.
     const x1 = (origX1 !== undefined) ? origX1 : s1.x;
     const y1 = (origY1 !== undefined) ? origY1 : s1.y;
-    const x2 = s2.x,  y2 = s2.y;
+    const x2 = (origX2 !== undefined) ? origX2 : s2.x;
+    const y2 = (origY2 !== undefined) ? origY2 : s2.y;
 
-    // Animate forward
-    this.animSwap(s1, s2, x2, y2, x1, y1, () => {
-      // Commit swap on board and sprite tracking
+    // Shared commit logic — runs after gems are in their new positions.
+    // On invalid swap, animates both back to their original grid homes.
+    const commit = () => {
       this.swapBoard(r1, c1, r2, c2);
       s1.row = r2; s1.col = c2;
       s2.row = r1; s2.col = c1;
@@ -580,7 +722,7 @@ class GameScene extends Phaser.Scene {
 
       const matches = this.findMatches();
       if (matches.length === 0) {
-        // Invalid — revert everything
+        // Invalid — revert board data and animate both gems home
         this.swapBoard(r1, c1, r2, c2);
         s1.row = r1; s1.col = c1;
         s2.row = r2; s2.col = c2;
@@ -592,7 +734,21 @@ class GameScene extends Phaser.Scene {
         this.updateHUD();
         this.processMatches(matches, 1);
       }
-    });
+    };
+
+    if (skipForwardAnim) {
+      // Gem A: snap to slot B (it was dragged there by the player).
+      // Gem B: snap to slot A (the preview tween may still be in flight;
+      //        setPosition gives the exact grid centre regardless).
+      this.tweens.killTweensOf(s1);
+      this.tweens.killTweensOf(s2);
+      s1.setPosition(x2, y2);
+      s2.setPosition(x1, y1);
+      commit();
+    } else {
+      // Fast-swipe path — neither gem has moved visually yet; animate both.
+      this.animSwap(s1, s2, x2, y2, x1, y1, commit);
+    }
   }
 
   /**
