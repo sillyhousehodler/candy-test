@@ -73,7 +73,10 @@ class GameScene extends Phaser.Scene {
     this.movesMax     = lvl.moves;   // starting move budget for this level
     this.board    = [];   // board[r][c] = type id (0-4), -1 = empty
     this.sprites  = [];   // sprites[r][c] = Phaser.GameObjects.Graphics
-    this.selected = null; // currently selected candy sprite
+    this.dragSprite = null; // candy the pointer went down on
+    this.dragStartX  = 0;
+    this.dragStartY  = 0;
+    this.dragAxis    = null; // 'h' | 'v' — locked once drag exceeds threshold
     this.score    = 0;
     this.moves    = this.movesMax;
     this.busy     = false; // blocks input during animations
@@ -82,6 +85,11 @@ class GameScene extends Phaser.Scene {
     this.initBoard();
     this.createAllSprites();
     this.createHUD();
+
+    // Live gem movement follows the pointer while dragging
+    this.input.on('pointermove', (pointer) => this.onDragMove(pointer));
+    // Resolve swap or snap-back when the pointer is released
+    this.input.on('pointerup',   (pointer) => this.onDragEnd(pointer));
   }
 
   // ── BACKGROUND ─────────────────────────────────────────────────────────────
@@ -319,7 +327,7 @@ class GameScene extends Phaser.Scene {
     gfx.row       = r;
     gfx.col       = c;
     gfx.candyType = type;
-    gfx.on('pointerdown', () => { if (!this.busy) this.onCandyClick(gfx); });
+    gfx.on('pointerdown', (pointer) => { if (!this.busy) this.onDragStart(gfx, pointer); });
     return gfx;
   }
 
@@ -426,73 +434,112 @@ class GameScene extends Phaser.Scene {
 
   // ── INPUT ──────────────────────────────────────────────────────────────────
   /**
-   * Click state machine — the single entry point for all player interaction.
+   * Records the candy and pointer position when the drag starts.
    *
-   * Three possible outcomes per click:
-   *   1. Nothing selected   → select the clicked candy.
-   *   2. Same candy again   → deselect it (toggle off).
-   *   3. Different candy:
-   *        a. Adjacent (Manhattan distance = 1) → attempt a swap.
-   *        b. Non-adjacent                      → change selection to new candy.
-   *
-   * Calls are silently ignored while this.busy is true (animations in progress).
-   *
-   * @param {Phaser.GameObjects.Graphics} sprite - The candy that was clicked.
+   * @param {Phaser.GameObjects.Graphics} sprite  - Candy pressed down on.
+   * @param {Phaser.Input.Pointer}        pointer - Phaser pointer event.
    */
-  onCandyClick(sprite) {
-    if (this.selected === null) {
-      this.select(sprite);
-    } else if (this.selected === sprite) {
-      this.deselect();
+  onDragStart(sprite, pointer) {
+    this.dragSprite  = sprite;
+    this.dragStartX  = pointer.x;
+    this.dragStartY  = pointer.y;
+    this.dragAxis    = null;
+    sprite._origX    = sprite.x;   // grid-centre position before any drag
+    sprite._origY    = sprite.y;
+    sprite.setDepth(1);            // float above neighbouring gems while held
+  }
+
+  /**
+   * Moves the dragged gem to follow the pointer in real time.
+   *
+   * Axis lock: once the pointer has moved > 8 px the dominant direction
+   * (horizontal or vertical) is fixed for the rest of the drag, matching
+   * the feel of mobile Candy Crush.
+   * Travel is capped at one full cell so the gem can never overshoot the
+   * adjacent slot.
+   */
+  onDragMove(pointer) {
+    if (!this.dragSprite || this.busy) return;
+
+    const dx    = pointer.x - this.dragStartX;
+    const dy    = pointer.y - this.dragStartY;
+    const absDx = Math.abs(dx);
+    const absDy = Math.abs(dy);
+
+    // Engage axis lock after the pointer has moved far enough
+    if (!this.dragAxis && Math.max(absDx, absDy) > 8) {
+      this.dragAxis = absDx >= absDy ? 'h' : 'v';
+    }
+
+    if (!this.dragAxis) return; // tap / no movement yet — gem stays put
+
+    const origX = this.dragSprite._origX;
+    const origY = this.dragSprite._origY;
+    const cap   = CFG.CELL; // maximum travel = one cell
+
+    if (this.dragAxis === 'h') {
+      this.dragSprite.x = origX + Phaser.Math.Clamp(dx, -cap, cap);
+      this.dragSprite.y = origY;
     } else {
-      const dr = Math.abs(sprite.row - this.selected.row);
-      const dc = Math.abs(sprite.col - this.selected.col);
-      if (dr + dc === 1) {
-        // Adjacent — try swap
-        const prev = this.selected;
-        this.deselect();
-        this.trySwap(prev, sprite);
-      } else {
-        // Not adjacent — change selection
-        this.deselect();
-        this.select(sprite);
-      }
+      this.dragSprite.x = origX;
+      this.dragSprite.y = origY + Phaser.Math.Clamp(dy, -cap, cap);
     }
   }
 
   /**
-   * Marks a candy as the active selection.
-   * Repaints it with the white ring and starts an infinite scale-pulse tween
-   * so the player knows which candy is "held".
+   * Resolves the drag on pointer-up.
    *
-   * Tuning:
-   *   - Pulse peak scale (1.12): how large the candy grows each cycle.
-   *     1.0 = no pulse. Values above ~1.2 can feel jittery.
-   *   - Pulse half-cycle duration (220 ms): time to grow or shrink once.
-   *     Lower for a faster heartbeat; higher for a slow, calm pulse.
+   * Primary path (gem moved visually): decide by which grid cell the gem's
+   * CENTRE is currently sitting in.
+   *   • Still in its original cell → springy snap back.
+   *   • In an adjacent cell        → attempt swap.
    *
-   * @param {Phaser.GameObjects.Graphics} sprite - Candy to select.
+   * Fallback path (fast swipe — pointermove never fired): fall back to the
+   * pointer displacement, requiring ≥ 30 % of a cell to trigger a swap.
    */
-  select(sprite) {
-    this.selected = sprite;
-    this.paintCandy(sprite, sprite.candyType, true);
-    this.tweens.add({
-      targets: sprite, scaleX: 1.12, scaleY: 1.12,
-      duration: 220, yoyo: true, repeat: -1,
-    });
-  }
+  onDragEnd(pointer) {
+    if (!this.dragSprite || this.busy) { this.dragSprite = null; return; }
 
-  /**
-   * Clears the current selection: kills the pulse tween, resets scale to 1,
-   * and repaints the candy without the selection ring.
-   * Safe to call when nothing is selected (no-op guard at the top).
-   */
-  deselect() {
-    if (!this.selected) return;
-    this.tweens.killTweensOf(this.selected);
-    this.selected.setScale(1);
-    this.paintCandy(this.selected, this.selected.candyType, false);
-    this.selected = null;
+    const src = this.dragSprite;
+    this.dragSprite = null;
+    src.setDepth(0); // restore normal render order
+
+    if (this.dragAxis) {
+      // Gem has moved — decide by where the centre is now
+      const curCol = Phaser.Math.Clamp(Math.floor((src.x - CFG.OX) / CFG.CELL), 0, CFG.COLS - 1);
+      const curRow = Phaser.Math.Clamp(Math.floor((src.y - CFG.OY) / CFG.CELL), 0, CFG.ROWS - 1);
+      const dc = curCol - src.col;
+      const dr = curRow - src.row;
+
+      if (Math.abs(dr) + Math.abs(dc) === 1) {
+        // Centre is in an adjacent cell — attempt swap
+        this.trySwap(src, this.sprites[src.row + dr][src.col + dc], src._origX, src._origY);
+        return;
+      }
+
+      // Centre is still in the original cell — snap back
+      this.tweens.add({
+        targets: src, x: src._origX, y: src._origY,
+        duration: 200, ease: 'Back.easeOut',
+      });
+      return;
+    }
+
+    // Fallback: fast swipe — gem never visually moved, use pointer delta
+    const dx    = pointer.x - this.dragStartX;
+    const dy    = pointer.y - this.dragStartY;
+    const absDx = Math.abs(dx);
+    const absDy = Math.abs(dy);
+    if (Math.max(absDx, absDy) >= CFG.CELL * 0.3) {
+      let dr = 0, dc = 0;
+      if (absDx >= absDy) dc = dx > 0 ? 1 : -1;
+      else                dr = dy > 0 ? 1 : -1;
+      const r2 = src.row + dr, c2 = src.col + dc;
+      if (r2 >= 0 && r2 < CFG.ROWS && c2 >= 0 && c2 < CFG.COLS) {
+        this.trySwap(src, this.sprites[r2][c2], src._origX, src._origY);
+      }
+    }
+    // else: plain tap — no action (gem is already at _origX/_origY)
   }
 
   // ── SWAP LOGIC ─────────────────────────────────────────────────────────────
@@ -512,10 +559,15 @@ class GameScene extends Phaser.Scene {
    * @param {Phaser.GameObjects.Graphics} s1 - First candy.
    * @param {Phaser.GameObjects.Graphics} s2 - Second candy (must be adjacent to s1).
    */
-  trySwap(s1, s2) {
+  trySwap(s1, s2, origX1, origY1) {
     this.busy = true;
     const r1 = s1.row, c1 = s1.col, r2 = s2.row, c2 = s2.col;
-    const x1 = s1.x,  y1 = s1.y,  x2 = s2.x,  y2 = s2.y;
+    // origX1/origY1 are the grid-home of s1 (passed when called after a drag
+    // so the revert animation returns to the correct position, not wherever
+    // the gem was dropped mid-drag).
+    const x1 = (origX1 !== undefined) ? origX1 : s1.x;
+    const y1 = (origY1 !== undefined) ? origY1 : s1.y;
+    const x2 = s2.x,  y2 = s2.y;
 
     // Animate forward
     this.animSwap(s1, s2, x2, y2, x1, y1, () => {
